@@ -8,6 +8,20 @@
 #
 # 下面是示例词，请改成你自己的研究方向 ↓
 
-phd position
-machine learning
-materials science
+Thermal Management
+Battery Management
+Smart HVAC
+Climate Control
+Electric Vehicle
+Automotive Control
+Automotive AI
+Data-driven Control
+Virtual Sensor
+Soft Sensor
+Physics-informed
+PIML
+Model Predictive Control
+Domain Adaptation
+Explainable AI
+Time Series Forecasting
+Applied AI
