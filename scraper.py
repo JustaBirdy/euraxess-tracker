@@ -7,6 +7,8 @@
 - 状态保存在 jobs.jsonl（纯文本，每行一个 JSON 对象），git diff 友好
 - jobs.xlsx 是从 jobs.jsonl 全量重写的「视图文件」，方便用 Excel 打开
 - 关键词放在 keywords.txt，每行一个；空行和 # 开头的注释行被忽略
+- 意向国家放在 countries.txt（英文国名，如 Germany/Switzerland/Sweden/Netherlands）；
+  留空 = 不限国家。国家用 facet 过滤(多国 OR)，ID 运行时从搜索页动态解析
 """
 
 from __future__ import annotations
@@ -34,11 +36,16 @@ SEARCH_URL = f"{BASE_URL}/jobs/search"
 
 ROOT = Path(__file__).parent
 KEYWORDS_FILE = ROOT / "keywords.txt"
+COUNTRIES_FILE = ROOT / "countries.txt"
 JSONL_PATH = ROOT / "jobs.jsonl"
 EXCEL_PATH = ROOT / "jobs.xlsx"
 
 # 每个关键词抓前 N 页。每页约 10 条，3 页 ≈ 30 条/关键词/天，足够覆盖每日新增
 MAX_PAGES_PER_KEYWORD = 3
+
+# 相邻两次请求之间的最小间隔（秒）。Euraxess 对高频访问会返回 429，需要放慢节奏。
+# 注意：GitHub Actions 跑在共享 IP 上，更容易被限流，这个值宁可大一点。
+REQUEST_DELAY = 3
 
 USER_AGENT = "euraxess-tracker/1.0 (+https://github.com/your-username/euraxess-tracker)"
 JOB_HREF_RE = re.compile(r"/jobs/(\d+)")
@@ -74,15 +81,65 @@ def load_keywords() -> list[str]:
     return kws
 
 
-def fetch_page(keyword: str, page: int) -> str:
-    """抓取一页搜索结果 HTML。"""
-    params = {
-        "keywords": keyword,
-        "sort_by": "publication_date",
+def load_countries() -> list[str]:
+    """读取 countries.txt（意向国家英文名），忽略空行和注释。留空=不限国家。"""
+    if not COUNTRIES_FILE.exists():
+        return []
+    cs = []
+    for line in COUNTRIES_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cs.append(line)
+    return cs
+
+
+def get_country_id_map() -> dict[str, str]:
+    """GET 一次搜索页，解析国家下拉框 select[name='job_country[]']，
+    返回 {国家名小写: facet ID}。Euraxess 用数字 ID 做 country facet（如
+    Germany=794），不硬编码、运行时动态解析以适配官方 ID 变动。
+    """
+    r = httpx.get(
+        SEARCH_URL, headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True
+    )
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    sel = soup.find("select", {"name": "job_country[]"})
+    m: dict[str, str] = {}
+    if sel:
+        for opt in sel.find_all("option"):
+            val = opt.get("value")
+            txt = opt.get_text(strip=True)
+            if val and txt:
+                m[txt.lower()] = val
+    return m
+
+
+def fetch_page(keyword: str, page: int, country_ids: list[str] | None = None) -> str | None:
+    """抓取一页搜索结果 HTML。
+
+    country_ids 为意向国家的 facet ID 列表（由 get_country_id_map 解析得到）；
+    非空时叠加国家过滤（多国 OR），为空则不限国家。
+
+    遇到 429 会优先尊重服务器的 Retry-After 头并指数退避重试；
+    彻底失败时返回 None（由调用方决定是否跳过该页），避免单页失败
+    让整个 run 崩掉、丢掉已抓到的数据。
+    """
+    # Euraxess 是 Drupal 站点：GET 的 ?keywords= 参数会被完全忽略——实测 nonsense
+    # 词、空参数、以及候选参数名(keys/text/search_api_fulltext)都返回同一批「全站最新」
+    # 岗位。真正生效的关键词过滤是 facet 参数 f[0]=keywords:<词>。已用对比实验验证：
+    # 正常词返回相关岗位、nonsense 词返回 0 条、page 翻页有效。默认排序即按发布时间
+    # 倒序(最新优先)，无需额外 sort 参数(原 sort_by=publication_date 本就是无效噪音)。
+    # f[0] 给关键词；f[1..] 给国家 facet（同 facet 多值 = OR）。
+    params: dict[str, str | int] = {
+        "f[0]": f"keywords:{keyword}",
         "page": page,
     }
-    # Euraxess 偶尔会慢，给点容错
-    for attempt in range(3):
+    for i, cid in enumerate(country_ids or []):
+        params[f"f[{i + 1}]"] = f"job_country:{cid}"
+    max_attempts = 5
+    backoff = 5.0  # 指数退避起点；每次翻倍，上限 60s
+    for attempt in range(1, max_attempts + 1):
         try:
             r = httpx.get(
                 SEARCH_URL,
@@ -91,13 +148,30 @@ def fetch_page(keyword: str, page: int) -> str:
                 timeout=30,
                 follow_redirects=True,
             )
+            # 429 单独处理：raise_for_status 抛的异常拿不到响应头，无法读 Retry-After
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After", "").strip()
+                if retry_after.isdigit():
+                    wait = min(int(retry_after), 60)
+                else:
+                    wait = backoff  # Retry-After 也可能是 HTTP-date，退回指数退避
+                print(f"  429 limited (keywords={keyword!r} page={page}); "
+                      f"sleep {wait}s, retry {attempt}/{max_attempts}")
+                time.sleep(wait)
+                backoff = min(backoff * 2, 60.0)
+                continue
             r.raise_for_status()
             return r.text
         except httpx.HTTPError as e:
-            if attempt == 2:
-                raise
-            print(f"  retry {attempt+1}/3 after error: {e}")
-            time.sleep(3)
+            if attempt == max_attempts:
+                print(f"  !! give up keywords={keyword!r} page={page} after "
+                      f"{max_attempts} attempts: {e}")
+                return None
+            print(f"  retry {attempt}/{max_attempts} after error: {e}; "
+                  f"sleep {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+    return None
 
 
 def parse_jobs(html: str, keyword: str) -> list[Job]:
@@ -277,16 +351,42 @@ def main() -> int:
     print(f"Keywords: {keywords}")
     print(f"Max pages per keyword: {MAX_PAGES_PER_KEYWORD}")
 
+    # 意向国家：解析成 facet ID（Euraxess 用数字 ID，如 Germany=794）
+    countries = load_countries()
+    country_ids: list[str] = []
+    allowed_country_names: set[str] = set()  # 小写，用于结果兜底过滤
+    if countries:
+        try:
+            cmap = get_country_id_map()
+        except httpx.HTTPError as e:
+            print(f"  !! 无法获取国家下拉框({e})，本次将不限国家抓取")
+            cmap = {}
+        for c in countries:
+            cid = cmap.get(c.lower())
+            if cid:
+                country_ids.append(cid)
+                allowed_country_names.add(c.lower())
+                print(f"  country {c} -> facet id {cid}")
+            else:
+                print(f"  !! 国家 {c!r} 在 Euraxess 下拉框里找不到，已跳过")
+        if not country_ids:
+            print("  没有解析到任何有效国家，将不限国家抓取")
+
     # 抓取
     all_jobs: list[Job] = []
     for kw in keywords:
         for page in range(MAX_PAGES_PER_KEYWORD):
             print(f"  fetching: keywords={kw!r} page={page}")
-            html = fetch_page(kw, page=page)
+            html = fetch_page(kw, page=page, country_ids=country_ids)
+            if html is None:
+                # 单页彻底抓不到（如持续限流）就跳过，继续跑后续关键词，
+                # 保住这一轮已经抓到的其它数据。
+                print(f"    skipped (fetch failed)")
+                continue
             jobs = parse_jobs(html, keyword=kw)
             print(f"    parsed {len(jobs)} jobs")
             all_jobs.extend(jobs)
-            time.sleep(1)  # 礼貌延迟
+            time.sleep(REQUEST_DELAY)  # 礼貌延迟，避免触发限流
 
     # job_id 去重（不同关键词可能抓到同一条；同关键词也可能跨页重复）
     unique: dict[str, Job] = {}
@@ -298,6 +398,14 @@ def main() -> int:
     # 与历史对比，挑出真正新增的
     seen = load_seen_ids()
     new_jobs = [j for j in unique.values() if j.job_id not in seen]
+
+    # 兜底：即便 facet 已按国家过滤，这里再按国家名筛一遍，保证数据干净
+    if allowed_country_names:
+        before = len(new_jobs)
+        new_jobs = [j for j in new_jobs if j.country.lower() in allowed_country_names]
+        if before != len(new_jobs):
+            print(f"Country backstop filtered {before - len(new_jobs)} non-target jobs")
+
     print(f"New jobs (not in history): {len(new_jobs)}")
 
     if new_jobs:

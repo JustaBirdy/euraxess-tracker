@@ -1,0 +1,7 @@
+# 意向国家（用 Euraxess 的英文国名，每行一个）
+# 支持多国：多个国家之间是「或」的关系（命中任一即收录）
+# 留空此文件（或全部注释）= 不限国家
+Germany
+Switzerland
+Sweden
+Netherlands
