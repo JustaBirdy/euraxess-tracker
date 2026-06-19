@@ -1,0 +1,13 @@
+# Euraxess 搜索关键词，每行一个
+# 空行和以 # 开头的行会被忽略
+# 提示：
+#   - 这里的词会作为 Euraxess 搜索框的输入（与网页搜索等价）
+#   - 多个词用空格分隔会被当作短语搜索，例如 "machine learning"
+#   - 想覆盖多个方向就写多行；脚本会逐个搜索后合并去重
+#   - 不要写太短/常见的单字（如 "AI"），结果会过宽
+#
+# 下面是示例词，请改成你自己的研究方向 ↓
+
+phd position
+machine learning
+materials science
